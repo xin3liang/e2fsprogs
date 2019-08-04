@@ -1279,6 +1279,10 @@ static struct e2fsck_problem problem_table[] = {
 	  N_("@h %i uses SipHash, but should not.  "),
 	  PROMPT_CLEAR_HTREE, PR_PREEN_OK, 0, 0, 0 },
 
+	/* Failed to goto block group */
+	{ PR_1_SCAN_GOTO,
+	  N_("failed to goto block group"),
+          PROMPT_NONE, PR_FATAL, 0, 0, 0 },
 
 	/* Pass 1b errors */
 
@@ -2503,6 +2507,12 @@ int fix_problem(e2fsck_t ctx, problem_t code, struct problem_context *pctx)
 	if (*message)
 		message = _(message);
 	if (!suppress) {
+#ifdef	HAVE_PTHREAD
+		if ((ctx->options & E2F_OPT_MULTITHREAD) && ctx->global_ctx)
+			printf("[Thread %d] ",
+			       ctx->thread_info.et_thread_index);
+#endif
+
 		if ((ctx->options & E2F_OPT_PREEN) &&
 		    !(ptr->flags & PR_PREEN_NOHDR)) {
 			printf("%s: ", ctx->device_name ?

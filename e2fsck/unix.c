@@ -75,13 +75,16 @@ int journal_enable_debug = -1;
 static void usage(e2fsck_t ctx)
 {
 	fprintf(stderr,
-		_("Usage: %s [-panyrcdfktvDFV] [-b superblock] [-B blocksize]\n"
+		_("Usage: %s [-pamnyrcdfktvDFV] [-b superblock] [-B blocksize]\n"
 		"\t\t[-l|-L bad_blocks_file] [-C fd] [-j external_journal]\n"
 		"\t\t[-E extended-options] [-z undo_file] device\n"),
 		ctx->program_name);
 
 	fprintf(stderr, "%s", _("\nEmergency help:\n"
 		" -p                   Automatic repair (no questions)\n"
+#ifdef HAVE_PTHREAD
+		" -m                   multiple threads to speedup fsck\n"
+#endif
 		" -n                   Make no changes to the filesystem\n"
 		" -y                   Assume \"yes\" to all questions\n"
 		" -c                   Check for bad blocks and add them to the badblock list\n"
@@ -823,6 +826,10 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 #ifdef CONFIG_JBD_DEBUG
 	char 		*jbd_debug;
 #endif
+#ifdef HAVE_PTHREAD
+	char		*pm;
+	unsigned long	thread_num;
+#endif
 	unsigned long long phys_mem_kb, blk;
 
 	retval = e2fsck_allocate_context(&ctx);
@@ -853,7 +860,12 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 
 	phys_mem_kb = get_memory_size() / 1024;
 	ctx->readahead_kb = ~0ULL;
+
+#ifdef HAVE_PTHREAD
+	while ((c = getopt(argc, argv, "pam:nyrcC:B:dE:fvtFVM:b:I:j:P:l:L:N:SsDkz:")) != EOF)
+#else
 	while ((c = getopt(argc, argv, "panyrcC:B:dE:fvtFVM:b:I:j:P:l:L:N:SsDkz:")) != EOF)
+#endif
 		switch (c) {
 		case 'C':
 			ctx->progress = e2fsck_update_progress;
@@ -894,6 +906,22 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 			}
 			ctx->options |= E2F_OPT_PREEN;
 			break;
+#ifdef HAVE_PTHREAD
+		case 'm':
+			thread_num = strtoul(optarg, &pm, 0);
+			if (*pm)
+				fatal_error(ctx,
+					_("Invalid multiple thread num.\n"));
+			if (thread_num > E2FSCK_MAX_THREADS) {
+				fprintf(stderr,
+					_("threads %lu too large (max %u)\n"),
+					thread_num, E2FSCK_MAX_THREADS);
+				fatal_error(ctx, 0);
+			}
+			ctx->options |= E2F_OPT_MULTITHREAD;
+			ctx->pfs_num_threads = thread_num;
+			break;
+#endif
 		case 'n':
 			if (ctx->options & (E2F_OPT_YES|E2F_OPT_PREEN))
 				goto conflict_opt;
@@ -1013,6 +1041,15 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 			_("The -n and -l/-L options are incompatible."));
 		fatal_error(ctx, 0);
 	}
+#ifdef HAVE_PTHREAD
+	if (ctx->options & E2F_OPT_MULTITHREAD) {
+		if ((ctx->options & (E2F_OPT_YES|E2F_OPT_NO|E2F_OPT_PREEN)) == 0) {
+			com_err(ctx->program_name, 0, "%s",
+				_("The -m option should be used together with one of -p/-y/-n options."));
+			fatal_error(ctx, 0);
+		}
+	}
+#endif
 	if (ctx->options & E2F_OPT_NO)
 		ctx->options |= E2F_OPT_READONLY;
 
@@ -1434,6 +1471,7 @@ int main (int argc, char *argv[])
 	}
 	reserve_stdio_fds();
 
+	ctx->global_ctx = NULL;
 	set_up_logging(ctx);
 	if (ctx->logf) {
 		int i;
@@ -1513,6 +1551,7 @@ restart:
 	}
 
 	ctx->openfs_flags = flags;
+	ctx->io_manager = io_ptr;
 	retval = try_open_fs(ctx, flags, io_ptr, &fs);
 
 	if (!ctx->superblock && !(ctx->options & E2F_OPT_PREEN) &&
@@ -1691,6 +1730,9 @@ failure:
 
 	ctx->fs = fs;
 	fs->now = ctx->now;
+#ifdef HAVE_PTHREAD
+	fs->fs_num_threads = ctx->pfs_num_threads;
+#endif
 	sb = fs->super;
 
 	if (sb->s_rev_level > E2FSCK_CURRENT_REV) {

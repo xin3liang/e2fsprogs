@@ -11,6 +11,7 @@
 
 #include "config.h"
 #include <stdlib.h>
+#include <assert.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <string.h>
@@ -35,6 +36,10 @@
 
 #ifdef HAVE_ERRNO_H
 #include <errno.h>
+#endif
+
+#ifdef HAVE_PTHREAD
+#include <pthread.h>
 #endif
 
 #include "e2fsck.h"
@@ -77,20 +82,75 @@ void fatal_error(e2fsck_t ctx, const char *msg)
 	}
 out:
 	ctx->flags |= E2F_FLAG_ABORT;
-	if (ctx->flags & E2F_FLAG_SETJMP_OK)
+	if (!(ctx->options & E2F_OPT_MULTITHREAD) &&
+	    ctx->flags & E2F_FLAG_SETJMP_OK)
 		longjmp(ctx->abort_loc, 1);
 	if (ctx->logf)
 		fprintf(ctx->logf, "Exit status: %d\n", exit_value);
 	exit(exit_value);
 }
 
+#ifdef HAVE_PTHREAD
+static void thread_log_out(struct e2fsck_thread *tinfo)
+{
+	printf("[Thread %d] %s", tinfo->et_thread_index,
+	       tinfo->et_log_buf);
+	tinfo->et_log_length = 0;
+	tinfo->et_log_buf[0] = '\0';
+}
+#endif
+
 void log_out(e2fsck_t ctx, const char *fmt, ...)
 {
 	va_list pvar;
+	struct e2fsck_thread *tinfo;
+	int buf_size;
+	int msg_size;
+	int left_size;
+	int fmt_length = strlen(fmt);
 
-	va_start(pvar, fmt);
-	vprintf(fmt, pvar);
-	va_end(pvar);
+#ifdef HAVE_PTHREAD
+	if ((ctx->options & E2F_OPT_MULTITHREAD) && ctx->global_ctx) {
+		tinfo = &ctx->thread_info;
+		buf_size = sizeof(tinfo->et_log_buf);
+		left_size = buf_size - tinfo->et_log_length;
+
+		va_start(pvar, fmt);
+		msg_size = vsnprintf(tinfo->et_log_buf + tinfo->et_log_length,
+				     left_size, fmt, pvar);
+		va_end(pvar);
+
+		if (msg_size >= left_size) {
+			tinfo->et_log_buf[tinfo->et_log_length] = '\0';
+
+			assert(msg_size < buf_size);
+			if (msg_size < buf_size) {
+				thread_log_out(tinfo);
+
+				va_start(pvar, fmt);
+				msg_size = vsnprintf(tinfo->et_log_buf, buf_size,
+						     fmt, pvar);
+				va_end(pvar);
+
+				tinfo->et_log_length += msg_size;
+				tinfo->et_log_buf[tinfo->et_log_length] = '\0';
+			}
+		} else {
+			tinfo->et_log_length += msg_size;
+			tinfo->et_log_buf[tinfo->et_log_length] = '\0';
+		}
+
+		if (tinfo->et_log_length > 0 &&
+		    tinfo->et_log_buf[tinfo->et_log_length - 1] == '\n')
+			thread_log_out(tinfo);
+	} else
+#endif
+	{
+		va_start(pvar, fmt);
+		vprintf(fmt, pvar);
+		va_end(pvar);
+	}
+
 	if (ctx->logf) {
 		va_start(pvar, fmt);
 		vfprintf(ctx->logf, fmt, pvar);
@@ -506,13 +566,136 @@ void e2fsck_read_inode_full(e2fsck_t ctx, unsigned long ino,
 	}
 }
 
+#ifdef HAVE_PTHREAD
+#define e2fsck_get_lock_context(ctx)		\
+	e2fsck_t global_ctx = ctx->global_ctx;	\
+	if (!global_ctx)			\
+		global_ctx = ctx;		\
+
+/**
+ * before we hold write lock, read lock should
+ * has been held.
+ */
+void e2fsck_pass1_fix_lock(e2fsck_t ctx)
+{
+	int err;
+
+	if (!ctx->fs_need_locking)
+		return;
+
+	e2fsck_get_lock_context(ctx);
+	err = pthread_rwlock_trywrlock(&global_ctx->fs_fix_rwlock);
+	assert(err != 0);
+	pthread_rwlock_unlock(&global_ctx->fs_fix_rwlock);
+	pthread_rwlock_wrlock(&global_ctx->fs_fix_rwlock);
+}
+
+void e2fsck_pass1_fix_unlock(e2fsck_t ctx)
+{
+	if (!ctx->fs_need_locking)
+		return;
+	e2fsck_get_lock_context(ctx);
+	/* unlock write lock */
+	pthread_rwlock_unlock(&global_ctx->fs_fix_rwlock);
+	/* get read lock again */
+	pthread_rwlock_rdlock(&global_ctx->fs_fix_rwlock);
+}
+
+void e2fsck_pass1_check_lock(e2fsck_t ctx)
+{
+	if (!ctx->fs_need_locking)
+		return;
+	e2fsck_get_lock_context(ctx);
+	pthread_rwlock_rdlock(&global_ctx->fs_fix_rwlock);
+}
+
+void e2fsck_pass1_check_unlock(e2fsck_t ctx)
+{
+	if (!ctx->fs_need_locking)
+		return;
+	e2fsck_get_lock_context(ctx);
+	pthread_rwlock_unlock(&global_ctx->fs_fix_rwlock);
+}
+
+void e2fsck_pass1_block_map_w_lock(e2fsck_t ctx)
+{
+	if (!ctx->fs_need_locking)
+		return;
+	e2fsck_get_lock_context(ctx);
+	pthread_rwlock_wrlock(&global_ctx->fs_block_map_rwlock);
+}
+
+void e2fsck_pass1_block_map_w_unlock(e2fsck_t ctx)
+{
+	if (!ctx->fs_need_locking)
+		return;
+	e2fsck_get_lock_context(ctx);
+	pthread_rwlock_unlock(&global_ctx->fs_block_map_rwlock);
+}
+
+void e2fsck_pass1_block_map_r_lock(e2fsck_t ctx)
+{
+	if (!ctx->fs_need_locking)
+		return;
+	e2fsck_get_lock_context(ctx);
+	pthread_rwlock_rdlock(&global_ctx->fs_block_map_rwlock);
+}
+
+void e2fsck_pass1_block_map_r_unlock(e2fsck_t ctx)
+{
+	if (!ctx->fs_need_locking)
+		return;
+	e2fsck_get_lock_context(ctx);
+	pthread_rwlock_unlock(&global_ctx->fs_block_map_rwlock);
+ }
+#else
+void e2fsck_pass1_fix_lock(e2fsck_t ctx)
+{
+
+}
+
+void e2fsck_pass1_fix_unlock(e2fsck_t ctx)
+{
+
+}
+void e2fsck_pass1_check_lock(e2fsck_t ctx)
+{
+
+}
+void e2fsck_pass1_check_unlock(e2fsck_t ctx)
+{
+
+}
+void e2fsck_pass1_block_map_w_lock(e2fsck_t ctx)
+{
+
+}
+
+void e2fsck_pass1_block_map_w_unlock(e2fsck_t ctx)
+{
+
+}
+
+void e2fsck_pass1_block_map_r_lock(e2fsck_t ctx)
+{
+
+}
+
+void e2fsck_pass1_block_map_r_unlock(e2fsck_t ctx)
+{
+
+}
+#endif
+
 void e2fsck_write_inode_full(e2fsck_t ctx, unsigned long ino,
 			     struct ext2_inode * inode, int bufsize,
 			     const char *proc)
 {
 	errcode_t retval;
 
+	e2fsck_pass1_fix_lock(ctx);
 	retval = ext2fs_write_inode_full(ctx->fs, ino, inode, bufsize);
+	e2fsck_pass1_fix_unlock(ctx);
 	if (retval) {
 		com_err("ext2fs_write_inode", retval,
 			_("while writing inode %lu in %s"), ino, proc);
@@ -525,7 +708,9 @@ void e2fsck_write_inode(e2fsck_t ctx, unsigned long ino,
 {
 	errcode_t retval;
 
+	e2fsck_pass1_fix_lock(ctx);
 	retval = ext2fs_write_inode(ctx->fs, ino, inode);
+	e2fsck_pass1_fix_unlock(ctx);
 	if (retval) {
 		com_err("ext2fs_write_inode", retval,
 			_("while writing inode %lu in %s"), ino, proc);

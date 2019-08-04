@@ -186,6 +186,7 @@ struct resource_track {
 #define E2F_OPT_UNSHARE_BLOCKS  0x40000
 #define E2F_OPT_CLEAR_UNINIT	0x80000 /* Hack to clear the uninit bit */
 #define E2F_OPT_CHECK_ENCODING  0x100000 /* Force verification of encoded filenames */
+#define E2F_OPT_MULTITHREAD	0x200000 /* Use multiple threads to speedup */
 
 /*
  * E2fsck flags
@@ -210,6 +211,7 @@ struct resource_track {
 #define E2F_FLAG_TIME_INSANE	0x2000 /* Time is insane */
 #define E2F_FLAG_PROBLEMS_FIXED	0x4000 /* At least one problem was fixed */
 #define E2F_FLAG_ALLOC_OK	0x8000 /* Can we allocate blocks? */
+#define E2F_FLAG_DUP_BLOCK	0x20000 /* dup block found during pass1 */
 
 #define E2F_RESET_FLAGS (E2F_FLAG_TIME_INSANE | E2F_FLAG_PROBLEMS_FIXED)
 
@@ -260,8 +262,30 @@ struct e2fsck_fc_replay_state {
 	__u16 fc_super_state;
 };
 
+#ifdef HAVE_PTHREAD
+/*
+ * Fields that used for multi-thread
+ */
+struct e2fsck_thread {
+	/* Thread index */
+	int		et_thread_index;
+	/* The start group number for this thread */
+	dgrp_t		et_group_start;
+	/* The end (not included) group number for this thread*/
+	dgrp_t		et_group_end;
+	/* The next group number to check */
+	dgrp_t		et_group_next;
+	/* Scanned inode number */
+	ext2_ino_t	et_inode_number;
+	char		et_log_length;
+	char		et_log_buf[2048];
+};
+#endif
+
 struct e2fsck_struct {
-	ext2_filsys fs;
+	/* Global context to get the cancel flag */
+	e2fsck_t		global_ctx;
+	ext2_filsys fs; /* [fs_fix_rwlock] */
 	const char *program_name;
 	char *filesystem_name;
 	char *device_name;
@@ -270,7 +294,9 @@ struct e2fsck_struct {
 	char	*log_fn;
 	FILE	*problem_logf;
 	char	*problem_log_fn;
-	int	flags;		/* E2fsck internal flags */
+	/* E2fsck internal flags.
+	 * shared by different threads for pass1 [fs_fix_rwlock] */
+	int	flags;
 	int	options;
 	unsigned blocksize;	/* blocksize */
 	blk64_t	use_superblock;	/* sb requested by user */
@@ -280,6 +306,7 @@ struct e2fsck_struct {
 	ext2_ino_t free_inodes;
 	int	mount_flags;
 	int	openfs_flags;
+	io_manager io_manager;
 	blkid_cache blkid;	/* blkid cache */
 
 #ifdef HAVE_SETJMP_H
@@ -290,6 +317,7 @@ struct e2fsck_struct {
 	int (*progress)(e2fsck_t ctx, int pass, unsigned long cur,
 			unsigned long max);
 
+	/* The following inode bitmaps are separately used in thread_ctx Pass1*/
 	ext2fs_inode_bitmap inode_used_map; /* Inodes which are in use */
 	ext2fs_inode_bitmap inode_bad_map; /* Inodes which are bad somehow */
 	ext2fs_inode_bitmap inode_dir_map; /* Inodes which are directories */
@@ -298,18 +326,21 @@ struct e2fsck_struct {
 	ext2fs_inode_bitmap inode_reg_map; /* Inodes which are regular files*/
 	ext2fs_inode_bitmap inode_casefold_map; /* Inodes which are casefolded */
 
+	/* Following 3 protected by [fs_block_map_rwlock] */
 	ext2fs_block_bitmap block_found_map; /* Blocks which are in use */
 	ext2fs_block_bitmap block_dup_map; /* Blks referenced more than once */
 	ext2fs_block_bitmap block_ea_map; /* Blocks which are used by EA's */
 
 	/*
-	 * Inode count arrays
+	 * Inode count arrays.
+	 * Separately used in thread_ctx, pass1
 	 */
 	ext2_icount_t	inode_count;
 	ext2_icount_t inode_link_info;
 
 	ext2_refcount_t	refcount;
 	ext2_refcount_t refcount_extra;
+	ext2_refcount_t refcount_orig;
 
 	/*
 	 * Quota blocks and inodes to be charged for each ea block.
@@ -324,7 +355,8 @@ struct e2fsck_struct {
 
 	/*
 	 * Array of flags indicating whether an inode bitmap, block
-	 * bitmap, or inode table is invalid
+	 * bitmap, or inode table is invalid.
+	 * Separately used in thread_ctx, pass1
 	 */
 	int *invalid_inode_bitmap_flag;
 	int *invalid_block_bitmap_flag;
@@ -337,10 +369,11 @@ struct e2fsck_struct {
 	char *block_buf;
 
 	/*
-	 * For pass1_check_directory and pass1_get_blocks
+	 * For pass1_check_directory and pass1_get_blocks.
+	 * Separately used in thread_ctx in pass1
 	 */
-	ext2_ino_t stashed_ino;
-	struct ext2_inode *stashed_inode;
+	ext2_ino_t		stashed_ino;
+	struct ext2_inode	*stashed_inode;
 
 	/*
 	 * Location of the lost and found directory
@@ -396,6 +429,7 @@ struct e2fsck_struct {
 
 	/*
 	 * How we display the progress update (for unix)
+	 * shared by different threads for pass1 [fs_fix_rwlock]
 	 */
 	int progress_fd;
 	int progress_pos;
@@ -404,7 +438,7 @@ struct e2fsck_struct {
 	int interactive;	/* Are we connected directly to a tty? */
 	char start_meta[2], stop_meta[2];
 
-	/* File counts */
+	/* File counts. Separately used in thread_ctx, pass1 */
 	__u32 fs_directory_count;
 	__u32 fs_regular_count;
 	__u32 fs_blockdev_count;
@@ -458,7 +492,48 @@ struct e2fsck_struct {
 
 	/* Fast commit replay state */
 	struct e2fsck_fc_replay_state fc_replay_state;
+#ifdef HAVE_PTHREAD
+	/* if @global_ctx is null, this field is unused */
+	struct e2fsck_thread	 thread_info;
+	__u32			 pfs_num_threads;
+	__u32			 mmp_update_thread;
+	int			 fs_need_locking;
+	/* serialize fix operation for multiple threads */
+	pthread_rwlock_t	 fs_fix_rwlock;
+	/* protect block_found_map, block_dup_map */
+	pthread_rwlock_t	 fs_block_map_rwlock;
+	struct e2fsck_thread_info	*infos;
+#endif
 };
+
+#ifdef HAVE_PTHREAD
+#ifdef DEBUG_THREADS
+/*
+ * Enabling DEBUG_THREADS would cause the parallel
+ * fsck threads run sequentially.
+ */
+struct e2fsck_thread_debug {
+	pthread_mutex_t	etd_mutex;
+	pthread_cond_t	etd_cond;
+	int		etd_finished_threads;
+};
+#endif
+
+struct e2fsck_thread_info {
+	/* ID returned by pthread_create() */
+	pthread_t		 eti_thread_id;
+	/* Application-defined thread index */
+	int			 eti_thread_index;
+	/* Thread has been started */
+	int			 eti_started;
+	/* Context used for this thread */
+	e2fsck_t		 eti_thread_ctx;
+#ifdef DEBUG_THREADS
+	struct e2fsck_thread_debug	*eti_debug;
+#endif
+};
+
+#endif
 
 /* Data structures to evaluate whether an extent tree needs rebuilding. */
 struct extent_tree_level {
@@ -487,6 +562,8 @@ extern int e2fsck_strnlen(const char * s, int count);
 
 extern void e2fsck_pass1(e2fsck_t ctx);
 extern void e2fsck_pass1_dupblocks(e2fsck_t ctx, char *block_buf);
+extern void e2fsck_pass1_check_lock(e2fsck_t ctx);
+extern void e2fsck_pass1_check_unlock(e2fsck_t ctx);
 extern void e2fsck_pass2(e2fsck_t ctx);
 extern void e2fsck_pass3(e2fsck_t ctx);
 extern void e2fsck_pass4(e2fsck_t ctx);
@@ -505,6 +582,8 @@ extern void read_bad_blocks_file(e2fsck_t ctx, const char *bad_blocks_file,
 
 /* dirinfo.c */
 extern void e2fsck_add_dir_info(e2fsck_t ctx, ext2_ino_t ino, ext2_ino_t parent);
+void e2fsck_merge_dir_info(e2fsck_t ctx, struct dir_info_db *src,
+                           struct dir_info_db *dest);
 extern void e2fsck_free_dir_info(e2fsck_t ctx);
 extern int e2fsck_get_num_dirinfo(e2fsck_t ctx);
 extern struct dir_info_iter *e2fsck_dir_info_iter_begin(e2fsck_t ctx);
@@ -519,6 +598,7 @@ extern int e2fsck_dir_info_get_parent(e2fsck_t ctx, ext2_ino_t ino,
 				      ext2_ino_t *parent);
 extern int e2fsck_dir_info_get_dotdot(e2fsck_t ctx, ext2_ino_t ino,
 				      ext2_ino_t *dotdot);
+extern void e2fsck_merge_dx_dir(e2fsck_t global_ctx, e2fsck_t thread_ctx);
 
 /* dx_dirinfo.c */
 extern void e2fsck_add_dx_dir(e2fsck_t ctx, ext2_ino_t ino,
@@ -658,6 +738,7 @@ int check_backup_super_block(e2fsck_t ctx);
 void check_resize_inode(e2fsck_t ctx);
 
 /* util.c */
+#define E2FSCK_MAX_THREADS	(65535)
 extern void *e2fsck_allocate_memory(e2fsck_t ctx, unsigned long size,
 				    const char *description);
 extern int ask(e2fsck_t ctx, const char * string, int def);
@@ -726,6 +807,12 @@ extern errcode_t e2fsck_allocate_subcluster_bitmap(ext2_filsys fs,
 						   const char *profile_name,
 						   ext2fs_block_bitmap *ret);
 unsigned long long get_memory_size(void);
+extern void e2fsck_pass1_fix_lock(e2fsck_t ctx);
+extern void e2fsck_pass1_fix_unlock(e2fsck_t ctx);
+extern void e2fsck_pass1_block_map_w_lock(e2fsck_t ctx);
+extern void e2fsck_pass1_block_map_w_unlock(e2fsck_t ctx);
+extern void e2fsck_pass1_block_map_r_lock(e2fsck_t ctx);
+extern void e2fsck_pass1_block_map_r_unlock(e2fsck_t ctx);
 
 /* unix.c */
 extern void e2fsck_clear_progbar(e2fsck_t ctx);

@@ -79,6 +79,10 @@ errcode_t e2fsck_reset_context(e2fsck_t ctx)
 		ext2fs_free_block_bitmap(ctx->inode_casefold_map);
 		ctx->inode_casefold_map = 0;
 	}
+	if (ctx->inodes_to_rebuild) {
+		ext2fs_free_inode_bitmap(ctx->inodes_to_rebuild);
+		ctx->inodes_to_rebuild = 0;
+	}
 	if (ctx->inode_link_info) {
 		ext2fs_free_icount(ctx->inode_link_info);
 		ctx->inode_link_info = 0;
@@ -101,6 +105,10 @@ errcode_t e2fsck_reset_context(e2fsck_t ctx)
 	if (ctx->refcount_extra) {
 		ea_refcount_free(ctx->refcount_extra);
 		ctx->refcount_extra = 0;
+	}
+	if (ctx->refcount_orig) {
+		ea_refcount_free(ctx->refcount_orig);
+		ctx->refcount_orig = 0;
 	}
 	if (ctx->ea_block_quota_blocks) {
 		ea_refcount_free(ctx->ea_block_quota_blocks);
@@ -187,6 +195,9 @@ errcode_t e2fsck_reset_context(e2fsck_t ctx)
 	ctx->fs_fragmented_dir = 0;
 	ctx->large_files = 0;
 	ctx->large_dirs = 0;
+#ifdef HAVE_PTHREAD
+	ctx->fs_need_locking = 0;
+#endif
 
 	for (i=0; i < MAX_EXTENT_DEPTH_COUNT; i++)
 		ctx->extent_depth_count[i] = 0;
