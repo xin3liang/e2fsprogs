@@ -622,6 +622,13 @@ typedef struct ext2_icount *ext2_icount_t;
 	  if ((struct)->magic != (code)) return (code)
 
 /*
+ * Flags for returning status of ext2fs_expand_extra_isize()
+ */
+#define EXT2_EXPAND_EISIZE_UNSAFE	0x0001
+#define EXT2_EXPAND_EISIZE_NEW_BLOCK	0x0002
+#define EXT2_EXPAND_EISIZE_NOSPC	0x0004
+
+/*
  * Features supported by this version of the library
  */
 #define EXT2_LIB_FEATURE_COMPAT_SUPP	(EXT2_FEATURE_COMPAT_DIR_PREALLOC|\
@@ -647,6 +654,7 @@ typedef struct ext2_icount *ext2_icount_t;
 					 EXT3_FEATURE_INCOMPAT_EXTENTS|\
 					 EXT4_FEATURE_INCOMPAT_FLEX_BG|\
 					 EXT4_FEATURE_INCOMPAT_EA_INODE|\
+					 EXT4_FEATURE_INCOMPAT_DIRDATA|\
 					 EXT4_LIB_INCOMPAT_MMP|\
 					 EXT4_FEATURE_INCOMPAT_64BIT|\
 					 EXT4_FEATURE_INCOMPAT_INLINE_DATA|\
@@ -1267,11 +1275,25 @@ extern errcode_t ext2fs_dup_handle(ext2_filsys src, ext2_filsys *dest);
 extern errcode_t ext2fs_expand_dir(ext2_filsys fs, ext2_ino_t dir);
 
 /* ext_attr.c */
+extern errcode_t ext2fs_attr_get(ext2_filsys fs, struct ext2_inode *inode,
+				 int name_index, const char *name, char *buffer,
+				 size_t buffer_size, int *easize);
+
 extern __u32 ext2fs_ext_attr_hash_entry(struct ext2_ext_attr_entry *entry,
 					void *data);
 extern errcode_t ext2fs_ext_attr_hash_entry2(ext2_filsys fs,
 					     struct ext2_ext_attr_entry *entry,
 					     void *data, __u32 *hash);
+int ext2fs_attr_get_next_attr(struct ext2_ext_attr_entry *entry, int name_index,
+			      char *buffer, int buffer_size, int start);
+errcode_t ext2fs_attr_set(ext2_filsys fs, ext2_ino_t ino,
+			  struct ext2_inode *inode,
+			  int name_index, const char *name, const char *value,
+			  int value_len, int flags);
+extern errcode_t ext2fs_expand_extra_isize(ext2_filsys fs, ext2_ino_t ino,
+					   struct ext2_inode_large *inode,
+					   int new_extra_isize, int *ret,
+					   int *needed_size);
 extern errcode_t ext2fs_read_ext_attr(ext2_filsys fs, blk_t block, void *buf);
 extern errcode_t ext2fs_read_ext_attr2(ext2_filsys fs, blk64_t block,
 				       void *buf);
@@ -1295,9 +1317,12 @@ extern errcode_t ext2fs_adjust_ea_refcount3(ext2_filsys fs, blk64_t blk,
 					   ext2_ino_t inum);
 errcode_t ext2fs_xattrs_write(struct ext2_xattr_handle *handle);
 errcode_t ext2fs_xattrs_read(struct ext2_xattr_handle *handle);
+errcode_t ext2fs_xattrs_read_inode(struct ext2_xattr_handle *handle,
+				   struct ext2_inode_large *inode);
 errcode_t ext2fs_xattrs_iterate(struct ext2_xattr_handle *h,
 				int (*func)(char *name, char *value,
-					    size_t value_len, void *data),
+					    size_t value_len,
+					    ext2_ino_t inode_num, void *data),
 				void *data);
 errcode_t ext2fs_xattr_get(struct ext2_xattr_handle *h, const char *key,
 			   void **value, size_t *value_len);
@@ -1524,6 +1549,7 @@ extern errcode_t ext2fs_calculate_summary_stats(ext2_filsys fs, int super_only);
 
 /* icount.c */
 extern void ext2fs_free_icount(ext2_icount_t icount);
+extern int ext2fs_icount_is_set(ext2_icount_t icount, ext2_ino_t ino);
 extern errcode_t ext2fs_create_icount_tdb(ext2_filsys fs, char *tdb_dir,
 					  int flags, ext2_icount_t *ret);
 extern errcode_t ext2fs_create_icount2(ext2_filsys fs, int flags,
@@ -2127,6 +2153,25 @@ _INLINE_ int ext2fs_htree_intnode_maxrecs(ext2_filsys fs, int blocks)
 						sizeof(struct ext2_dx_entry));
 }
 
+_INLINE_ struct ext2_dx_root_info *get_ext2_dx_root_info(ext2_filsys fs,
+							 char *buf)
+{
+	struct ext2_dir_entry *de = (struct ext2_dir_entry *)buf;
+
+	if (!(fs->super->s_feature_incompat & EXT4_FEATURE_INCOMPAT_DIRDATA))
+		return (struct ext2_dx_root_info *)(buf +
+						    EXT2_DIR_NAME_LEN(1) +
+						    EXT2_DIR_NAME_LEN(2));
+
+	/* get dotdot first */
+	de = (struct ext2_dir_entry *)((char *)de + de->rec_len);
+
+	/* dx root info is after dotdot entry */
+	de = (struct ext2_dir_entry *)((char *)de + EXT2_DIR_REC_LEN(de));
+
+	return (struct ext2_dx_root_info *)de;
+}
+
 /*
  * This is an efficient, overflow safe way of calculating ceil((1.0 * a) / b)
  */
@@ -2146,7 +2191,7 @@ _INLINE_ __u64 ext2fs_div64_ceil(__u64 a, __u64 b)
 
 _INLINE_ int ext2fs_dirent_name_len(const struct ext2_dir_entry *entry)
 {
-	return entry->name_len & 0xff;
+	return entry->name_len & EXT2_NAME_LEN;
 }
 
 _INLINE_ void ext2fs_dirent_set_name_len(struct ext2_dir_entry *entry, int len)

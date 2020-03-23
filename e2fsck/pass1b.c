@@ -341,6 +341,14 @@ static void pass1b(e2fsck_t ctx, char *block_buf)
 		pb.last_blk = 0;
 		pb.pctx->blk = pb.pctx->blk2 = 0;
 
+		if (e2fsck_fix_bad_inode(ctx, &pctx)) {
+			struct dup_inode dp = { .inode = inode };
+
+			/* delete_file only uses dp.inode */
+			delete_file(ctx, ino, &dp, block_buf);
+			continue;
+		}
+
 		if (ext2fs_inode_has_valid_blocks2(fs, EXT2_INODE(&inode)) ||
 		    (ino == EXT2_BAD_INO))
 			pctx.errcode = ext2fs_block_iterate3(fs, ino,
@@ -542,6 +550,9 @@ static void pass1d(e2fsck_t ctx, char *block_buf)
 			q = (struct dup_cluster *) dnode_get(m);
 			if (q->num_bad > 1)
 				file_ok = 0;
+			if (q->num_bad == 1 && (ctx->clone == E2F_CLONE_ZERO ||
+			    ctx->shared != E2F_SHARED_PRESERVE))
+				file_ok = 0;
 			if (check_if_fs_cluster(ctx, s->cluster)) {
 				file_ok = 0;
 				meta_data = 1;
@@ -573,7 +584,7 @@ static void pass1d(e2fsck_t ctx, char *block_buf)
 		pctx.dir = p->dir;
 		pctx.blkcount = p->num_dupblocks;
 		pctx.num = meta_data ? shared_len+1 : shared_len;
-		fix_problem(ctx, PR_1D_DUP_FILE, &pctx);
+		fix_problem_bad(ctx, PR_1D_DUP_FILE, &pctx, pctx.blkcount / 2);
 		pctx.blkcount = 0;
 		pctx.num = 0;
 
@@ -591,24 +602,37 @@ static void pass1d(e2fsck_t ctx, char *block_buf)
 			pctx.inode = EXT2_INODE(&t->inode);
 			pctx.ino = shared[i];
 			pctx.dir = t->dir;
-			fix_problem(ctx, PR_1D_DUP_FILE_LIST, &pctx);
+			fix_problem_bad(ctx, PR_1D_DUP_FILE_LIST, &pctx, 0);
 		}
 		/*
 		 * Even if the file shares blocks with itself, we still need to
 		 * clone the blocks.
 		 */
 		if (file_ok && (meta_data ? shared_len+1 : shared_len) != 0) {
-			fix_problem(ctx, PR_1D_DUP_BLOCKS_DEALT, &pctx);
+			fix_problem_bad(ctx, PR_1D_DUP_BLOCKS_DEALT, &pctx, 0);
 			continue;
 		}
-		if ((ctx->options & E2F_OPT_UNSHARE_BLOCKS) ||
-                    fix_problem(ctx, PR_1D_CLONE_QUESTION, &pctx)) {
+		if (ctx->shared != E2F_SHARED_DELETE &&
+		    ((ctx->options & E2F_OPT_UNSHARE_BLOCKS) ||
+                    fix_problem(ctx, PR_1D_CLONE_QUESTION, &pctx))) {
 			pctx.errcode = clone_file(ctx, ino, p, block_buf);
-			if (pctx.errcode)
+			if (pctx.errcode) {
 				fix_problem(ctx, PR_1D_CLONE_ERROR, &pctx);
-			else
-				continue;
+				goto delete;
+			}
+			if (ctx->shared == E2F_SHARED_LPF &&
+			    fix_problem(ctx, PR_1D_DISCONNECT_QUESTION, &pctx)){
+				pctx.errcode = ext2fs_unlink(fs, p->dir,
+							     NULL, ino, 0);
+				if (pctx.errcode) {
+					fix_problem(ctx, PR_1D_DISCONNECT_ERROR,
+						    &pctx);
+					goto delete;
+				}
+			}
+			continue;
 		}
+delete:
 		/*
 		 * Note: When unsharing blocks, we don't prompt to delete
 		 * files. If the clone operation fails than the unshare
@@ -632,7 +656,8 @@ static void decrement_badcount(e2fsck_t ctx, blk64_t block,
 {
 	p->num_bad--;
 	if (p->num_bad <= 0 ||
-	    (p->num_bad == 1 && !check_if_fs_block(ctx, block))) {
+	    (p->num_bad == 1 && !check_if_fs_block(ctx, block) &&
+	    ctx->clone == E2F_CLONE_DUP)) {
 		if (check_if_fs_cluster(ctx, EXT2FS_B2C(ctx->fs, block)))
 			return;
 		ext2fs_unmark_block_bitmap2(ctx->block_dup_map, block);
@@ -704,8 +729,6 @@ static void delete_file(e2fsck_t ctx, ext2_ino_t ino,
 						     delete_file_block, &pb);
 	if (pctx.errcode)
 		fix_problem(ctx, PR_1B_BLOCK_ITERATE, &pctx);
-	if (ctx->inode_bad_map)
-		ext2fs_unmark_inode_bitmap2(ctx->inode_bad_map, ino);
 	if (ctx->inode_reg_map)
 		ext2fs_unmark_inode_bitmap2(ctx->inode_reg_map, ino);
 	ext2fs_unmark_inode_bitmap2(ctx->inode_dir_map, ino);
@@ -783,6 +806,12 @@ static void deferred_dec_badcount(struct clone_struct *cs)
 	if (!cs->save_dup_cluster)
 		return;
 	decrement_badcount(cs->ctx, cs->save_blocknr, cs->save_dup_cluster);
+	if (cs->ctx->clone == E2F_CLONE_ZERO &&
+	    cs->save_dup_cluster->num_bad == 0) {
+		ext2fs_unmark_block_bitmap2(cs->ctx->block_found_map,
+					    cs->save_blocknr);
+		ext2fs_block_alloc_stats(cs->ctx->fs, cs->save_blocknr, -1);
+	}
 	cs->save_dup_cluster = NULL;
 }
 
@@ -882,10 +911,15 @@ cluster_alloc_ok:
 		       blockcnt, (unsigned long long) *block_nr,
 		       (unsigned long long) new_block);
 #endif
-		retval = io_channel_read_blk64(fs->io, *block_nr, 1, cs->buf);
-		if (retval) {
-			cs->errcode = retval;
-			return BLOCK_ABORT;
+		if (ctx->clone == E2F_CLONE_ZERO) {
+			memset(cs->buf, 0, fs->blocksize);
+		} else {
+			retval = io_channel_read_blk64(fs->io, *block_nr, 1,
+						       cs->buf);
+			if (retval) {
+				cs->errcode = retval;
+				return BLOCK_ABORT;
+			}
 		}
 		if (should_write) {
 			retval = io_channel_write_blk64(fs->io, new_block, 1, cs->buf);

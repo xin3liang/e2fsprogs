@@ -87,6 +87,10 @@ errcode_t e2fsck_reset_context(e2fsck_t ctx)
 		ext2fs_free_icount(ctx->inode_link_info);
 		ctx->inode_link_info = 0;
 	}
+	if (ctx->inode_badness) {
+		ext2fs_free_icount(ctx->inode_badness);
+		ctx->inode_badness = 0;
+	}
 	if (ctx->journal_io) {
 		if (ctx->fs && ctx->fs->io != ctx->journal_io)
 			io_channel_close(ctx->journal_io);
@@ -137,10 +141,6 @@ errcode_t e2fsck_reset_context(e2fsck_t ctx)
 	if (ctx->inode_bb_map) {
 		ext2fs_free_inode_bitmap(ctx->inode_bb_map);
 		ctx->inode_bb_map = 0;
-	}
-	if (ctx->inode_bad_map) {
-		ext2fs_free_inode_bitmap(ctx->inode_bad_map);
-		ctx->inode_bad_map = 0;
 	}
 	if (ctx->inode_imagic_map) {
 		ext2fs_free_inode_bitmap(ctx->inode_imagic_map);
@@ -198,6 +198,7 @@ errcode_t e2fsck_reset_context(e2fsck_t ctx)
 #ifdef HAVE_PTHREAD
 	ctx->fs_need_locking = 0;
 #endif
+	ctx->fs_unexpanded_inodes = 0;
 
 	for (i=0; i < MAX_EXTENT_DEPTH_COUNT; i++)
 		ctx->extent_depth_count[i] = 0;

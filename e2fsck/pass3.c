@@ -22,7 +22,7 @@
  * will offer to reconnect it to /lost+found.  While it is chasing
  * parent pointers up the filesystem tree, if pass3 sees a directory
  * twice, then it has detected a filesystem loop, and it will again
- * offer to reconnect the directory to /lost+found in to break the
+ * offer to reconnect the directory to /lost+found in order to break the
  * filesystem loop.
  *
  * Pass 3 also contains the subroutine, e2fsck_reconnect_file() to
@@ -304,7 +304,7 @@ static int check_directory(e2fsck_t ctx, ext2_ino_t dir,
 		 * If it was marked done already, then we've reached a
 		 * parent we've already checked.
 		 */
-	  	if (ext2fs_mark_inode_bitmap2(inode_done_map, ino))
+		if (ext2fs_mark_inode_bitmap2(inode_done_map, ino))
 			break;
 
 		if (e2fsck_dir_info_get_parent(ctx, ino, &parent)) {
@@ -319,13 +319,18 @@ static int check_directory(e2fsck_t ctx, ext2_ino_t dir,
 		 */
 		if (!parent ||
 		    (loop_pass &&
-		     (ext2fs_test_inode_bitmap2(inode_loop_detect,
-					       parent)))) {
+		     ext2fs_test_inode_bitmap2(inode_loop_detect, parent))) {
 			pctx->ino = ino;
-			if (fix_problem(ctx, PR_3_UNCONNECTED_DIR, pctx)) {
-				if (e2fsck_reconnect_file(ctx, pctx->ino))
+			if (parent)
+				pctx->dir = parent;
+			else
+				ext2fs_lookup(fs, ino, "..", 2, NULL,
+					      &pctx->dir);
+			if (fix_problem(ctx, !parent ? PR_3_UNCONNECTED_DIR :
+						       PR_3_LOOPED_DIR, pctx)) {
+				if (e2fsck_reconnect_file(ctx, pctx->ino)) {
 					ext2fs_unmark_valid(fs);
-				else {
+				} else {
 					fix_dotdot(ctx, pctx->ino,
 						   ctx->lost_and_found);
 					parent = ctx->lost_and_found;
@@ -464,7 +469,7 @@ unlink:
 		pctx.errcode = retval;
 		fix_problem(ctx, PR_3_ERR_FIND_LPF, &pctx);
 	}
-	if (!fix_problem(ctx, PR_3_NO_LF_DIR, 0))
+	if (!fix_problem(ctx, PR_3_NO_LF_DIR, &pctx))
 		return 0;
 
 	/*
@@ -704,6 +709,7 @@ static int fix_dotdot_proc(struct ext2_dir_entry *dirent,
 	struct fix_dotdot_struct *fp = (struct fix_dotdot_struct *) priv_data;
 	errcode_t	retval;
 	struct problem_context pctx;
+	__u16 dirdata = 0;
 
 	if (ext2fs_dirent_name_len(dirent) != 2)
 		return 0;
@@ -723,10 +729,16 @@ static int fix_dotdot_proc(struct ext2_dir_entry *dirent,
 		fix_problem(fp->ctx, PR_3_ADJUST_INODE, &pctx);
 	}
 	dirent->inode = fp->parent;
+
+	dirdata  = dirent->name_len & ((__u16)~EXT2_FT_MASK << 8);
+
 	if (ext2fs_has_feature_filetype(fp->ctx->fs->super))
 		ext2fs_dirent_set_file_type(dirent, EXT2_FT_DIR);
 	else
 		ext2fs_dirent_set_file_type(dirent, EXT2_FT_UNKNOWN);
+
+	if (ext2fs_has_feature_dirdata(fp->ctx->fs->super))
+		dirent->name_len |= dirdata;
 
 	fp->done++;
 	return DIRENT_ABORT | DIRENT_CHANGED;

@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 #ifdef HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -211,6 +212,7 @@ struct resource_track {
 #define E2F_FLAG_TIME_INSANE	0x2000 /* Time is insane */
 #define E2F_FLAG_PROBLEMS_FIXED	0x4000 /* At least one problem was fixed */
 #define E2F_FLAG_ALLOC_OK	0x8000 /* Can we allocate blocks? */
+#define E2F_FLAG_EXPAND_EISIZE	0x10000 /* Expand the inodes (i_extra_isize) */
 #define E2F_FLAG_DUP_BLOCK	0x20000 /* dup block found during pass1 */
 
 #define E2F_RESET_FLAGS (E2F_FLAG_TIME_INSANE | E2F_FLAG_PROBLEMS_FIXED)
@@ -224,6 +226,33 @@ struct resource_track {
 #define E2F_PASS_4	4
 #define E2F_PASS_5	5
 #define E2F_PASS_1B	6
+
+enum shared_opt {
+	E2F_SHARED_PRESERVE = 0,
+	E2F_SHARED_DELETE,
+	E2F_SHARED_LPF
+};
+
+enum clone_opt {
+	E2F_CLONE_DUP = 0,
+	E2F_CLONE_ZERO
+};
+
+#define EXT4_FITS_IN_INODE(ext4_inode, einode, field)	\
+	((offsetof(typeof(*ext4_inode), field) +	\
+	  sizeof(ext4_inode->field)) <=			\
+	   (EXT2_GOOD_OLD_INODE_SIZE +			\
+	    (einode)->i_extra_isize))			\
+
+#define EXT4_XTIME_FUTURE(ctx, sb, xtime, margin)	\
+	(!((ctx)->flags & E2F_FLAG_TIME_INSANE) &&	\
+	 (xtime) > (ctx)->now + (margin))
+#define EXT4_XTIME_ANCIENT(ctx, sb, xtime, margin)	\
+	((sb)->s_mkfs_time > (margin) && (xtime) < (sb)->s_mkfs_time - (margin))
+
+#define BADNESS_THRESHOLD	12
+#define BADNESS_BAD_MODE	0x8000
+#define BADNESS_MAX		0x7fff
 
 /*
  * Define the extended attribute refcount structure
@@ -277,7 +306,7 @@ struct e2fsck_thread {
 	dgrp_t		et_group_next;
 	/* Scanned inode number */
 	ext2_ino_t	et_inode_number;
-	char		et_log_length;
+	int		et_log_length;
 	char		et_log_buf[2048];
 };
 #endif
@@ -319,7 +348,6 @@ struct e2fsck_struct {
 
 	/* The following inode bitmaps are separately used in thread_ctx Pass1*/
 	ext2fs_inode_bitmap inode_used_map; /* Inodes which are in use */
-	ext2fs_inode_bitmap inode_bad_map; /* Inodes which are bad somehow */
 	ext2fs_inode_bitmap inode_dir_map; /* Inodes which are directories */
 	ext2fs_inode_bitmap inode_bb_map; /* Inodes which are in bad blocks */
 	ext2fs_inode_bitmap inode_imagic_map; /* AFS inodes */
@@ -337,6 +365,8 @@ struct e2fsck_struct {
 	 */
 	ext2_icount_t	inode_count;
 	ext2_icount_t inode_link_info;
+	ext2_icount_t inode_badness;
+	unsigned int inode_badness_threshold;
 
 	ext2_refcount_t	refcount;
 	ext2_refcount_t refcount_extra;
@@ -465,9 +495,20 @@ struct e2fsck_struct {
 	time_t now;
 	time_t time_fudge;	/* For working around buggy init scripts */
 	int ext_attr_ver;
+	enum shared_opt shared;
+	enum clone_opt clone;
 	profile_t	profile;
 	int blocks_per_page;
 	ext2_u32_list casefolded_dirs;
+
+	/* Expand large inodes to atleast these many bytes */
+	int want_extra_isize;
+	/* minimum i_extra_isize found in used inodes. Should not be lesser
+	 * than s_min_extra_isize.
+	 */
+	__u32 min_extra_isize;
+	int fs_unexpanded_inodes;
+	ext2fs_inode_bitmap expand_eisize_map;
 
 	/* Reserve blocks for root and l+f re-creation */
 	blk64_t root_repair_block, lnf_repair_block;
@@ -644,6 +685,8 @@ __u32 find_encryption_policy(e2fsck_t ctx, ext2_ino_t ino);
 
 void destroy_encryption_policy_map(e2fsck_t ctx);
 void destroy_encrypted_file_info(e2fsck_t ctx);
+int e2fsck_merge_encrypted_info(e2fsck_t ctx, struct encrypted_file_info *src,
+				struct encrypted_file_info *dest);
 
 /* extents.c */
 errcode_t e2fsck_rebuild_extents_later(e2fsck_t ctx, ext2_ino_t ino);
@@ -680,11 +723,19 @@ extern errcode_t e2fsck_setup_icount(e2fsck_t ctx, const char *icount_name,
 extern void e2fsck_use_inode_shortcuts(e2fsck_t ctx, int use_shortcuts);
 extern int e2fsck_pass1_check_device_inode(ext2_filsys fs,
 					   struct ext2_inode *inode);
-extern int e2fsck_pass1_check_symlink(ext2_filsys fs, ext2_ino_t ino,
+extern int e2fsck_pass1_check_symlink(e2fsck_t ctx, ext2_ino_t ino,
 				      struct ext2_inode *inode, char *buf);
 extern void e2fsck_clear_inode(e2fsck_t ctx, ext2_ino_t ino,
 			       struct ext2_inode *inode, int restart_flag,
 			       const char *source);
+#define e2fsck_mark_inode_bad(ctx, pctx, code) \
+	e2fsck_mark_inode_bad_loc(ctx, pctx, code, 1, __func__, __LINE__)
+#define e2fsck_mark_inode_badder(ctx, pctx, code) \
+	e2fsck_mark_inode_bad_loc(ctx, pctx, code, 2, __func__, __LINE__)
+extern void e2fsck_mark_inode_bad_loc(e2fsck_t ctx,
+				struct problem_context *pctx, __u32 code,
+				int count, const char *func, const int line);
+extern int e2fsck_fix_bad_inode(e2fsck_t ctx, struct problem_context *pctx);
 extern void e2fsck_intercept_block_allocations(e2fsck_t ctx);
 
 /* pass2.c */

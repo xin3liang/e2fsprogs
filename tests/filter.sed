@@ -20,6 +20,7 @@ s/\\015//g
 /^Maximum mount count:/d
 /^Next check after:/d
 /^Suggestion:/d
+/security.selinux/d
 /Reserved blocks uid:/s/ (user .*)//
 /Reserved blocks gid:/s/ (group .*)//
 /whichever comes first/d
@@ -38,3 +39,4 @@ s/mmp_update_date: .*/mmp_update_date: test date/
 s/mmp_update_time: .*/mmp_update_time: test_time/
 s/MMP last updated by '.*' on .*/MMP last updated by 'test_node' on test date/
 s/MMP update by '.*' at .*/MMP last updated by 'test_node' on test date/
+s/:[0-9]*: \(increase inode [0-9]* badness\)/: \1/

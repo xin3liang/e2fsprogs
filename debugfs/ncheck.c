@@ -51,6 +51,9 @@ static int ncheck_proc(struct ext2_dir_entry *dirent,
 	iw->position++;
 	if (iw->position <= 2)
 		return 0;
+	if (current_fs->super->s_feature_incompat &
+	    EXT4_FEATURE_INCOMPAT_DIRDATA)
+		filetype &= EXT2_FT_MASK;
 	for (i=0; i < iw->num_inodes; i++) {
 		if (iw->iarray[i] == dirent->inode) {
 			if (!iw->parent && !iw->get_pathname_failed) {
@@ -134,9 +137,21 @@ void do_ncheck(int argc, char **argv, int sci_idx EXT2FS_ATTR((unused)),
 
 	iw.names_left = 0;
 	for (i=0; i < argc; i++) {
-		iw.iarray[i] = strtol(argv[i], &tmp, 0);
+		char *str = argv[i];
+		int len = strlen(str);
+
+		if ((len > 2) && (str[0] == '<') && (str[len-1] == '>')) {
+			str[len-1] = '\0';
+			str++;
+		}
+		iw.iarray[i] = strtol(str, &tmp, 0);
 		if (*tmp) {
-			com_err("ncheck", 0, "Bad inode - %s", argv[i]);
+			if (str != argv[i]) {
+				str--;
+				str[len-1] = '>';
+			}
+			com_err("ncheck", 0, "Invalid inode number - '%s'",
+				argv[i]);
 			goto error_out;
 		}
 		if (debugfs_read_inode(iw.iarray[i], &inode, *argv))

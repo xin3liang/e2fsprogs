@@ -516,6 +516,12 @@ struct ext2_inode_large {
        (size >= (sizeof(((struct ext2_inode_large *)0)->field) + \
                  offsetof(struct ext2_inode_large, field)))
 
+#define EXT2_FITS_IN_INODE(inode, field)	      \
+	((offsetof(struct ext2_inode_large, field) +    \
+	 sizeof((inode)->field)) <=		     \
+			 (EXT2_GOOD_OLD_INODE_SIZE +    \
+			  (inode)->i_extra_isize))      \
+
 #if defined(__KERNEL__) || defined(__linux__)
 #define i_reserved1	osd1.linux1.l_i_reserved1
 #define i_frag		osd2.linux2.l_i_frag
@@ -969,12 +975,14 @@ EXT4_FEATURE_INCOMPAT_FUNCS(casefold,		4, CASEFOLD)
 #define EXT2_FEATURE_INCOMPAT_SUPP    (EXT2_FEATURE_INCOMPAT_FILETYPE| \
 				       EXT4_FEATURE_INCOMPAT_MMP| \
 				       EXT4_FEATURE_INCOMPAT_LARGEDIR| \
-				       EXT4_FEATURE_INCOMPAT_EA_INODE)
+				       EXT4_FEATURE_INCOMPAT_EA_INODE| \
+				       EXT4_FEATURE_INCOMPAT_DIRDATA)
 #define EXT2_FEATURE_RO_COMPAT_SUPP	(EXT2_FEATURE_RO_COMPAT_SPARSE_SUPER| \
 					 EXT2_FEATURE_RO_COMPAT_LARGE_FILE| \
 					 EXT4_FEATURE_RO_COMPAT_DIR_NLINK| \
 					 EXT2_FEATURE_RO_COMPAT_BTREE_DIR| \
-					 EXT4_FEATURE_RO_COMPAT_VERITY)
+					 EXT4_FEATURE_RO_COMPAT_VERITY| \
+					 EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE)
 
 /*
  * Default values for user and/or group using reserved blocks
@@ -1083,6 +1091,7 @@ struct ext2_dir_entry_tail {
 #define EXT2_FT_SYMLINK		7
 
 #define EXT2_FT_MAX		8
+#define EXT2_FT_MASK		0x0f
 
 /*
  * Annoyingly, e2fsprogs always swab16s ext2_dir_entry.name_len, so we
@@ -1091,6 +1100,9 @@ struct ext2_dir_entry_tail {
  * "invalid" file type.
  */
 #define EXT2_DIR_NAME_LEN_CSUM	0xDE00
+
+int ext2_get_dirdata_field_size(struct ext2_dir_entry *de, char dirdata_flags);
+int ext2_get_dirdata_size(struct ext2_dir_entry *de);
 
 /*
  * EXT2_DIR_PAD defines the directory entries boundaries
@@ -1101,7 +1113,13 @@ struct ext2_dir_entry_tail {
 #define EXT2_DIR_ENTRY_HASH_LEN		8
 #define EXT2_DIR_PAD			4
 #define EXT2_DIR_ROUND			(EXT2_DIR_PAD - 1)
-#define EXT2_DIR_REC_LEN(name_len) ext2fs_dir_rec_len(name_len, 0)
+#define EXT2_DIR_NAME_LEN(name_len)	(((name_len) + \
+					  EXT2_DIR_ENTRY_HEADER_LEN + \
+					  EXT2_DIR_ROUND) & \
+					 ~EXT2_DIR_ROUND)
+#define EXT2_DIR_REC_LEN(de)	(EXT2_DIR_NAME_LEN(((de)->name_len &         \
+						     EXT2_NAME_LEN) +         \
+						    ext2_get_dirdata_size(de)))
 
 static inline unsigned int ext2fs_dir_rec_len(__u8 name_len,
 						int extended)
@@ -1113,6 +1131,20 @@ static inline unsigned int ext2fs_dir_rec_len(__u8 name_len,
 		rec_len += EXT2_DIR_ENTRY_HASH_LEN;
 	return rec_len;
 }
+
+static inline unsigned int ext2fs_dirdata_rec_len(struct ext2_dir_entry *de,
+						int extended)
+{
+	int rec_len = EXT2_DIR_REC_LEN(de);
+
+	if (extended)
+		rec_len += EXT2_DIR_ENTRY_HASH_LEN;
+	return rec_len;
+}
+
+/* lu_fid size and NUL char */
+#define EXT2_DIRENT_LUFID_SIZE		16
+#define EXT2_DIRENT_LUFID		0x10
 
 /*
  * Constants for ext4's extended time encoding
@@ -1185,5 +1217,7 @@ struct mmp_struct {
 #define EXT4_ENC_UTF8_12_1	1
 
 #define EXT4_ENC_STRICT_MODE_FL			(1 << 0) /* Reject invalid sequences */
+
+#define EXT2_NEXT_DIRENT(d)	((void *)((char *)(d) + (d)->rec_len))
 
 #endif	/* _LINUX_EXT2_FS_H */

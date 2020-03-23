@@ -662,6 +662,49 @@ static void signal_cancel(int sig EXT2FS_ATTR((unused)))
 }
 #endif
 
+static void initialize_profile_options(e2fsck_t ctx)
+{
+	char *tmp;
+
+	/* [options] shared=preserve|lost+found|delete */
+	tmp = NULL;
+	ctx->shared = E2F_SHARED_PRESERVE;
+	profile_get_string(ctx->profile, "options", "shared", 0,
+			   "preserve", &tmp);
+	if (tmp) {
+		if (strcmp(tmp, "preserve") == 0)
+			ctx->shared = E2F_SHARED_PRESERVE;
+		else if (strcmp(tmp, "delete") == 0)
+			ctx->shared = E2F_SHARED_DELETE;
+		else if (strcmp(tmp, "lost+found") == 0)
+			ctx->shared = E2F_SHARED_LPF;
+		else {
+			com_err(ctx->program_name, 0,
+				_("configuration error: 'shared=%s'"), tmp);
+			fatal_error(ctx, 0);
+		}
+		free(tmp);
+	}
+
+	/* [options] clone=dup|zero */
+	tmp = NULL;
+	ctx->clone = E2F_CLONE_DUP;
+	profile_get_string(ctx->profile, "options", "clone", 0,
+			   "dup", &tmp);
+	if (tmp) {
+		if (strcmp(tmp, "dup") == 0)
+			ctx->clone = E2F_CLONE_DUP;
+		else if (strcmp(tmp, "zero") == 0)
+			ctx->clone = E2F_CLONE_ZERO;
+		else {
+			com_err(ctx->program_name, 0,
+				_("configuration error: 'clone=%s'"), tmp);
+			fatal_error(ctx, 0);
+		}
+		free(tmp);
+	}
+}
+
 static void parse_extended_opts(e2fsck_t ctx, const char *opts)
 {
 	char	*buf, *token, *next, *p, *arg;
@@ -712,6 +755,58 @@ static void parse_extended_opts(e2fsck_t ctx, const char *opts)
 		} else if (strcmp(token, "fragcheck") == 0) {
 			ctx->options |= E2F_OPT_FRAGCHECK;
 			continue;
+		/* -E shared=preserve|lost+found|delete */
+		} else if (strcmp(token, "shared") == 0) {
+			if (!arg) {
+				extended_usage++;
+				continue;
+			}
+			if (strcmp(arg, "preserve") == 0) {
+				ctx->shared = E2F_SHARED_PRESERVE;
+			} else if (strcmp(arg, "lost+found") == 0) {
+				ctx->shared = E2F_SHARED_LPF;
+			} else if (strcmp(arg, "delete") == 0) {
+				ctx->shared = E2F_SHARED_DELETE;
+			} else {
+				extended_usage++;
+				continue;
+			}
+		/* -E clone=dup|zero */
+		} else if (strcmp(token, "clone") == 0) {
+			if (!arg) {
+				extended_usage++;
+				continue;
+			}
+			if (strcmp(arg, "dup") == 0) {
+				ctx->clone = E2F_CLONE_DUP;
+			} else if (strcmp(arg, "zero") == 0) {
+				ctx->clone = E2F_CLONE_ZERO;
+			} else {
+				extended_usage++;
+				continue;
+			}
+		} else if (strcmp(token, "expand_extra_isize") == 0) {
+			ctx->flags |= E2F_FLAG_EXPAND_EISIZE;
+			if (arg) {
+				extended_usage++;
+				continue;
+			}
+		/* -E inode_badness_threshold=<value> */
+		} else if (strcmp(token, "inode_badness_threshold") == 0) {
+			unsigned int val;
+
+			if (!arg) {
+				extended_usage++;
+				continue;
+			}
+			val = strtoul(arg, &p, 0);
+			if (*p != '\0' || (val < 3 && val != 0) || val > 200) {
+				fprintf(stderr, _("Invalid badness '%s'\n"),
+					arg);
+				extended_usage++;
+				continue;
+			}
+			ctx->inode_badness_threshold = val;
 		} else if (strcmp(token, "journal_only") == 0) {
 			if (arg) {
 				extended_usage++;
@@ -784,6 +879,10 @@ static void parse_extended_opts(e2fsck_t ctx, const char *opts)
 		fputs("\tjournal_only\n", stderr);
 		fputs("\tdiscard\n", stderr);
 		fputs("\tnodiscard\n", stderr);
+		fputs(("\tshared=<preserve|lost+found|delete>\n"), stderr);
+		fputs(("\tclone=<dup|zero>\n"), stderr);
+		fputs(("\texpand_extra_isize\n"), stderr);
+		fputs(("\tinode_badness_threhold=(value)\n"), stderr);
 		fputs("\toptimize_extents\n", stderr);
 		fputs("\tno_optimize_extents\n", stderr);
 		fputs("\tinode_count_fullmap\n", stderr);
@@ -820,7 +919,6 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 #ifdef HAVE_SIGNAL_H
 	struct sigaction	sa;
 #endif
-	char		*extended_opts = 0;
 	char		*cp;
 	int 		res;		/* result of sscanf */
 #ifdef CONFIG_JBD_DEBUG
@@ -858,8 +956,17 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 	else
 		ctx->program_name = "e2fsck";
 
+	cp = getenv("E2FSCK_CONFIG");
+	if (cp != NULL)
+		config_fn[0] = cp;
+	profile_set_syntax_err_cb(syntax_err_report);
+	profile_init(config_fn, &ctx->profile);
+
+	initialize_profile_options(ctx);
+
 	phys_mem_kb = get_memory_size() / 1024;
 	ctx->readahead_kb = ~0ULL;
+	ctx->inode_badness_threshold = BADNESS_THRESHOLD;
 
 #ifdef HAVE_PTHREAD
 	while ((c = getopt(argc, argv, "pam:nyrcC:B:dE:fvtFVM:b:I:j:P:l:L:N:SsDkz:")) != EOF)
@@ -895,7 +1002,7 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 			ctx->options |= E2F_OPT_COMPRESS_DIRS;
 			break;
 		case 'E':
-			extended_opts = optarg;
+			parse_extended_opts(ctx, optarg);
 			break;
 		case 'p':
 		case 'a':
@@ -1062,8 +1169,6 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 			argv[optind]);
 		fatal_error(ctx, 0);
 	}
-	if (extended_opts)
-		parse_extended_opts(ctx, extended_opts);
 
 	/* Complain about mutually exclusive rebuilding activities */
 	if (getenv("E2FSCK_FIXES_ONLY"))
@@ -1080,11 +1185,6 @@ static errcode_t PRS(int argc, char *argv[], e2fsck_t *ret_ctx)
 			_("The -E bmap2extent and fixes_only options are incompatible."));
 		fatal_error(ctx, 0);
 	}
-
-	if ((cp = getenv("E2FSCK_CONFIG")) != NULL)
-		config_fn[0] = cp;
-	profile_set_syntax_err_cb(syntax_err_report);
-	profile_init(config_fn, &ctx->profile);
 
 	profile_get_boolean(ctx->profile, "options", "report_time", 0, 0,
 			    &c);
@@ -1876,6 +1976,14 @@ print_unsupp_features:
 		goto get_newer;
 	}
 
+	if (ext2fs_has_feature_dirdata(sb) &&
+	    ext2fs_has_feature_casefold(sb)) {
+		com_err(ctx->program_name, 0,
+			_("%s has both casefold and dirdata, aborting fsck"),
+			ctx->filesystem_name);
+		fatal_error(ctx, 0);
+	}
+
 	if (ext2fs_has_feature_casefold(sb) && !fs->encoding) {
 		log_err(ctx, _("%s has unsupported encoding: %0x\n"),
 			ctx->filesystem_name, sb->s_encoding);
@@ -1912,6 +2020,52 @@ print_unsupp_features:
 	if (ctx->flags & E2F_FLAG_SIGNAL_MASK)
 		fatal_error(ctx, 0);
 	check_if_skip(ctx);
+
+	if (EXT2_GOOD_OLD_INODE_SIZE + sb->s_want_extra_isize >
+							EXT2_INODE_SIZE(sb)) {
+		if (fix_problem(ctx, PR_0_WANT_EXTRA_ISIZE_INVALID, &pctx))
+			sb->s_want_extra_isize =
+				sizeof(struct ext2_inode_large) -
+				EXT2_GOOD_OLD_INODE_SIZE;
+	}
+	if (EXT2_GOOD_OLD_INODE_SIZE + sb->s_min_extra_isize >
+							EXT2_INODE_SIZE(sb)) {
+		if (fix_problem(ctx, PR_0_MIN_EXTRA_ISIZE_INVALID, &pctx))
+			sb->s_min_extra_isize = 0;
+	}
+	if (EXT2_INODE_SIZE(sb) > EXT2_GOOD_OLD_INODE_SIZE) {
+		ctx->want_extra_isize = sizeof(struct ext2_inode_large) -
+						     EXT2_GOOD_OLD_INODE_SIZE;
+		ctx->min_extra_isize = ~0L;
+		if (EXT2_HAS_RO_COMPAT_FEATURE(sb,
+				       EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE)) {
+			if (ctx->want_extra_isize < sb->s_want_extra_isize)
+				ctx->want_extra_isize = sb->s_want_extra_isize;
+			if (ctx->want_extra_isize < sb->s_min_extra_isize)
+				ctx->want_extra_isize = sb->s_min_extra_isize;
+		}
+	} else {
+		/* Leave extra_isize set, it is harmless, and clearing it
+		 * here breaks some regression tests by printing an extra
+		 * message to the output for very little value. */
+		sb->s_want_extra_isize = 0;
+		sb->s_min_extra_isize = 0;
+		ctx->flags &= ~E2F_FLAG_EXPAND_EISIZE;
+	}
+
+	if (ctx->options & E2F_OPT_READONLY) {
+		if (ctx->flags & (E2F_FLAG_EXPAND_EISIZE)) {
+			fprintf(stderr, _("Cannot enable EXTRA_ISIZE feature "
+					  "on read-only filesystem\n"));
+			exit(1);
+		}
+	} else {
+		if (sb->s_want_extra_isize > sb->s_min_extra_isize &&
+		    (sb->s_feature_ro_compat &
+		     EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE))
+			ctx->flags |= E2F_FLAG_EXPAND_EISIZE;
+	}
+
 	check_resize_inode(ctx);
 	if (bad_blocks_file)
 		read_bad_blocks_file(ctx, bad_blocks_file, replace_bad_blocks);

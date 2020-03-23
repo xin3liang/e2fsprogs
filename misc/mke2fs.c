@@ -24,10 +24,6 @@
 #include <strings.h>
 #include <ctype.h>
 #include <time.h>
-#ifdef __linux__
-#include <sys/utsname.h>
-#define KERNEL_VERSION(a,b,c) (((a) << 16) + ((b) << 8) + (c))
-#endif
 #ifdef HAVE_GETOPT_H
 #include <getopt.h>
 #else
@@ -164,54 +160,6 @@ int int_log10(unsigned long long arg)
 		arg = arg / 10;
 	return l;
 }
-
-#ifdef __linux__
-static int parse_version_number(const char *s)
-{
-	int	major, minor, rev;
-	char	*endptr;
-	const char *cp = s;
-
-	if (!s)
-		return 0;
-	major = strtol(cp, &endptr, 10);
-	if (cp == endptr || *endptr != '.')
-		return 0;
-	cp = endptr + 1;
-	minor = strtol(cp, &endptr, 10);
-	if (cp == endptr || *endptr != '.')
-		return 0;
-	cp = endptr + 1;
-	rev = strtol(cp, &endptr, 10);
-	if (cp == endptr)
-		return 0;
-	return KERNEL_VERSION(major, minor, rev);
-}
-
-static int is_before_linux_ver(unsigned int major, unsigned int minor,
-			       unsigned int rev)
-{
-	struct		utsname ut;
-	static int	linux_version_code = -1;
-
-	if (uname(&ut)) {
-		perror("uname");
-		exit(1);
-	}
-	if (linux_version_code < 0)
-		linux_version_code = parse_version_number(ut.release);
-	if (linux_version_code == 0)
-		return 0;
-
-	return linux_version_code < (int) KERNEL_VERSION(major, minor, rev);
-}
-#else
-static int is_before_linux_ver(unsigned int major, unsigned int minor,
-			       unsigned int rev)
-{
-	return 0;
-}
-#endif
 
 /*
  * Helper function for read_bb_file and test_disk
@@ -1165,6 +1113,7 @@ static __u32 ok_features[3] = {
 		EXT4_FEATURE_INCOMPAT_FLEX_BG|
 		EXT4_FEATURE_INCOMPAT_EA_INODE|
 		EXT4_FEATURE_INCOMPAT_MMP |
+		EXT4_FEATURE_INCOMPAT_DIRDATA|
 		EXT4_FEATURE_INCOMPAT_64BIT|
 		EXT4_FEATURE_INCOMPAT_INLINE_DATA|
 		EXT4_FEATURE_INCOMPAT_ENCRYPT |
@@ -1488,6 +1437,9 @@ struct device_param {
 	unsigned int dax:1;		/* supports dax? */
 };
 
+#define	OPTIMIZED_STRIPE_WIDTH	512
+#define	OPTIMIZED_STRIDE	512
+
 #ifdef HAVE_BLKID_PROBE_GET_TOPOLOGY
 /*
  * Sets the geometry of a device (stripe/stride), and returns the
@@ -1518,7 +1470,19 @@ static int get_device_geometry(const char *file,
 		goto out;
 
 	dev_param->min_io = blkid_topology_get_minimum_io_size(tp);
+	if (dev_param->min_io > OPTIMIZED_STRIDE) {
+		fprintf(stdout,
+			"detected raid stride %lu too large, use optimum %lu\n",
+			dev_param->min_io, OPTIMIZED_STRIDE);
+		dev_param->min_io = OPTIMIZED_STRIDE;
+	}
 	dev_param->opt_io = blkid_topology_get_optimal_io_size(tp);
+	if (dev_param->opt_io > OPTIMIZED_STRIPE_WIDTH) {
+		fprintf(stdout,
+			"detected raid stripe width %lu too large, use optimum %lu\n",
+			dev_param->opt_io, OPTIMIZED_STRIPE_WIDTH);
+		dev_param->opt_io = OPTIMIZED_STRIPE_WIDTH;
+	}
 	if ((dev_param->min_io == 0) && (psector_size > blocksize))
 		dev_param->min_io = psector_size;
 	if ((dev_param->opt_io == 0) && dev_param->min_io > 0)
@@ -1637,7 +1601,7 @@ profile_error:
 	memset(&fs_param, 0, sizeof(struct ext2_super_block));
 	fs_param.s_rev_level = 1;  /* Create revision 1 filesystems now */
 
-	if (is_before_linux_ver(2, 2, 0))
+	if (ext2fs_is_before_linux_ver(2, 2, 0))
 		fs_param.s_rev_level = 0;
 
 	if (argc && *argv) {
@@ -2058,8 +2022,7 @@ profile_error:
 	 * be appropriately configured.
 	 */
 	fs_types = parse_fs_type(fs_type, usage_types, &fs_param,
-				 fs_blocks_count ? fs_blocks_count : dev_size,
-				 argv[0]);
+				 fs_blocks_count, argv[0]);
 	if (!fs_types) {
 		fprintf(stderr, "%s", _("Failed to parse fs types list\n"));
 		exit(1);
@@ -2162,7 +2125,8 @@ profile_error:
 
 		if (use_bsize == -1) {
 			use_bsize = sys_page_size;
-			if (is_before_linux_ver(2, 6, 0) && use_bsize > 4096)
+			if (ext2fs_is_before_linux_ver(2, 6, 0) &&
+			    use_bsize > 4096)
 				use_bsize = 4096;
 		}
 		if (lsector_size && use_bsize < lsector_size)
@@ -2192,24 +2156,25 @@ profile_error:
 	 * We now need to do a sanity check of fs_blocks_count for
 	 * 32-bit vs 64-bit block number support.
 	 */
-	if ((fs_blocks_count > MAX_32_NUM) &&
-	    ext2fs_has_feature_64bit(&fs_param))
-		ext2fs_clear_feature_resize_inode(&fs_param);
-	if ((fs_blocks_count > MAX_32_NUM) &&
-	    !ext2fs_has_feature_64bit(&fs_param) &&
-	    get_bool_from_profile(fs_types, "auto_64-bit_support", 0)) {
-		ext2fs_set_feature_64bit(&fs_param);
-		ext2fs_clear_feature_resize_inode(&fs_param);
-	}
-	if ((fs_blocks_count > MAX_32_NUM) &&
-	    !ext2fs_has_feature_64bit(&fs_param)) {
-		fprintf(stderr, _("%s: Size of device (0x%llx blocks) %s "
+	if (fs_blocks_count > MAX_32_NUM) {
+		if (!ext2fs_has_feature_64bit(&fs_param) &&
+		    get_bool_from_profile(fs_types, "auto_64-bit_support", 0))
+			ext2fs_set_feature_64bit(&fs_param);
+
+		if (ext2fs_has_feature_64bit(&fs_param)) {
+			ext2fs_clear_feature_resize_inode(&fs_param);
+		} else {
+			fprintf(stderr,
+				_("%s: Size of device (0x%llx blocks) %s "
 				  "too big to be expressed\n\t"
 				  "in 32 bits using a blocksize of %d.\n"),
-			program_name, (unsigned long long) fs_blocks_count,
-			device_name, EXT2_BLOCK_SIZE(&fs_param));
-		exit(1);
+				program_name,
+				(unsigned long long) fs_blocks_count,
+				device_name, EXT2_BLOCK_SIZE(&fs_param));
+			exit(1);
+		}
 	}
+
 	/*
 	 * Guard against group descriptor count overflowing... Mostly to avoid
 	 * strange results for absurdly large devices.  This is in log2:
@@ -2289,13 +2254,13 @@ profile_error:
 		fs_param.s_feature_compat = 0;
 		fs_param.s_feature_ro_compat &=
 					EXT4_FEATURE_RO_COMPAT_METADATA_CSUM;
- 	}
+	}
 
 	/* Check the user's mkfs options for 64bit */
-	if (ext2fs_has_feature_64bit(&fs_param) &&
+	if (fs_blocks_count > MAX_32_NUM &&
 	    !ext2fs_has_feature_extents(&fs_param)) {
-		printf("%s", _("Extents MUST be enabled for a 64-bit "
-			       "filesystem.  Pass -O extents to rectify.\n"));
+		printf("%s", _("Extents MUST be enabled for filesystems with "
+			       "over 2^32 blocks. Use '-O extents' to fix.\n"));
 		exit(1);
 	}
 
@@ -2394,7 +2359,7 @@ profile_error:
 	}
 
 	/* Metadata checksumming wasn't totally stable before 3.18. */
-	if (is_before_linux_ver(3, 18, 0) &&
+	if (ext2fs_is_before_linux_ver(3, 18, 0) &&
 	    ext2fs_has_feature_metadata_csum(&fs_param))
 		fprintf(stderr, _("Suggestion: Use Linux kernel >= 3.18 for "
 			"improved stability of the metadata and journal "
@@ -2404,7 +2369,7 @@ profile_error:
 	 * On newer kernels we do have lazy_itable_init support. So pick the
 	 * right default in case ext4 module is not loaded.
 	 */
-	if (is_before_linux_ver(2, 6, 37))
+	if (ext2fs_is_before_linux_ver(2, 6, 37))
 		lazy_itable_init = 0;
 	else
 		lazy_itable_init = 1;
@@ -2623,15 +2588,11 @@ _("128-byte inodes cannot handle dates beyond 2038 and are deprecated\n"));
 		unsigned long long n;
 		n = ext2fs_blocks_count(&fs_param) * blocksize / inode_ratio;
 		if (n > MAX_32_NUM) {
-			if (ext2fs_has_feature_64bit(&fs_param))
-				num_inodes = MAX_32_NUM;
-			else {
+			num_inodes = MAX_32_NUM;
+			if (!ext2fs_has_feature_64bit(&fs_param))
 				com_err(program_name, 0,
-					_("too many inodes (%llu), raise "
-					  "inode ratio?"),
-					(unsigned long long) n);
-				exit(1);
-			}
+					_("too many inodes (%llu), reduced to "
+					  "%llu"), n, MAX_32_NUM);
 		}
 	} else if (num_inodes > MAX_32_NUM) {
 		com_err(program_name, 0,
@@ -3080,6 +3041,19 @@ int main (int argc, char *argv[])
 		printf("%s", _("The metadata_csum_seed feature "
 			       "requires the metadata_csum feature.\n"));
 		exit(1);
+	}
+
+	if (ext2fs_has_feature_dirdata(fs->super)) {
+		if (ext2fs_has_feature_inline_data(fs->super)) {
+			printf("%s", _("The dirdata feature can not enabled "
+				       "with inline data feature.\n"));
+			exit(1);
+		}
+		if (ext2fs_has_feature_casefold(fs->super)) {
+			printf("%s", _("The dirdata feature can not enabled "
+				       "with casefold feature.\n"));
+			exit(1);
+		}
 	}
 
 	/* Calculate journal blocks */

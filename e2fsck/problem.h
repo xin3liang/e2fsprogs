@@ -288,6 +288,15 @@ struct problem_context {
 /* Meta_bg and resize_inode are not compatible, remove resize_inode*/
 #define PR_0_DISABLE_RESIZE_INODE		0x000051
 
+/* Invalid s_min_extra_isize */
+#define PR_0_MIN_EXTRA_ISIZE_INVALID		0x000052
+
+/* Invalid s_want_extra_isize */
+#define PR_0_WANT_EXTRA_ISIZE_INVALID		0x000053
+
+/* Clear EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE flag */
+#define PR_0_CLEAR_EXTRA_ISIZE			0x000054
+
 /*
  * Pass 1 errors
  */
@@ -685,6 +694,9 @@ struct problem_context {
 /* Inode has illegal EA value inode */
 #define PR_1_ATTR_VALUE_EA_INODE		0x010083
 
+/* Inode has bad timestamp */
+#define PR_1_INODE_BAD_TIME			0x010084
+
 /* Parent inode has invalid EA entry. EA inode does not have
  * EXT4_EA_INODE_FL flag. Delete EA entry? */
 #define PR_1_ATTR_NO_EA_INODE_FL		0x010085
@@ -715,6 +727,31 @@ struct problem_context {
 
 /* Htree directory uses SipHash but should not */
 #define PR_1_HTREE_CANNOT_SIPHASH		0x01008E
+
+/* Warning for user that all inodes need to be expanded atleast by
+ * s_min_extra_isize
+ */
+#define PR_1_EXPAND_EISIZE_WARNING		0x01008F
+
+/* Expand the inode */
+#define PR_1_EXPAND_EISIZE			0x010090
+
+/* Delete an EA so that EXTRA_ISIZE may be enabled */
+#define PR_1_EISIZE_DELETE_EA			0x010091
+
+/* An EA needs to be deleted by e2fsck is being run with -p or -y */
+#define PR_1_EA_BLK_NOSPC			0x010092
+
+/* Disable EXTRA_ISIZE feature as inode cannot be expanded
+ * without deletion of an EA
+ */
+#define PR_1_CLEAR_EXTRA_ISIZE			0x010093
+
+/* invalid inode creation time */
+#define PR_1_CRTIME_BAD				0x010094
+
+/* Symlink missing NUL terminator */
+#define PR_1_SYMLINK_NUL			0x010095
 
 /* Failed to goto block group */
 #define PR_1_SCAN_GOTO				0x0100A0
@@ -750,6 +787,9 @@ struct problem_context {
 /* Duplicate/bad block range in inode */
 #define PR_1B_DUP_RANGE		0x011008
 
+/* Inode is badly corrupt (badness value = ) */
+#define PR_1B_INODE_TOOBAD	0x011009
+
 /* Pass 1C: Scan directories for inodes with dup blocks. */
 #define PR_1C_PASS_HEADER	0x012000
 
@@ -780,6 +820,13 @@ struct problem_context {
 
 /* Couldn't clone file (error) */
 #define PR_1D_CLONE_ERROR	0x013008
+
+/* File with shared blocks found */
+#define PR_1D_DISCONNECT_QUESTION 0x013009
+
+/* Couldn't unlink file (error) */
+#define PR_1D_DISCONNECT_ERROR	0x01300A
+
 
 /*
  * Pass 1e --- rebuilding extent trees
@@ -1046,6 +1093,12 @@ struct problem_context {
 /* Non-unique filename found, but can't rename */
 #define PR_2_NON_UNIQUE_FILE_NO_RENAME	0x020054
 
+/* Inode is badly corrupt (badness value = ) */
+#define PR_2_INODE_TOOBAD		0x020055
+
+/* Entry dirdata length set incorrectly */
+#define PR_2_CLEAR_DIRDATA		0x020056
+
 /*
  * Pass 3 errors
  */
@@ -1133,6 +1186,9 @@ struct problem_context {
 
 /* Lost+found is encrypted */
 #define PR_3_LPF_ENCRYPTED		0x03001B
+
+/* Recursively looped directory inode */
+#define PR_3_LOOPED_DIR			0x03001D
 
 /*
  * Pass 3a --- rehashing directories
@@ -1273,6 +1329,9 @@ struct problem_context {
 /* Block bitmap checksum does not match */
 #define PR_5_BLOCK_BITMAP_CSUM_INVALID	0x05001B
 
+/* Expand the inodes which need a new EA block */
+#define PR_5_EXPAND_EISIZE		0x05001C
+
 /*
  * Post-Pass 5 errors
  */
@@ -1299,7 +1358,12 @@ struct problem_context {
 /*
  * Function declarations
  */
-int fix_problem(e2fsck_t ctx, problem_t code, struct problem_context *pctx);
+#define fix_problem(ctx, code, pctx)	\
+	fix_problem_bad(ctx, code, pctx, 1)
+#define fix_problem_bad(ctx, code, pctx, badness)	\
+	fix_problem_loc(ctx, code, pctx, badness, __func__, __LINE__)
+int fix_problem_loc(e2fsck_t ctx, problem_t code, struct problem_context *pctx,
+		    int badness, const char *func, const int line);
 int end_problem_latch(e2fsck_t ctx, int mask);
 int set_latch_flags(int mask, int setflags, int clearflags);
 int get_latch_flags(int mask, int *value);
